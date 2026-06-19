@@ -1,7 +1,16 @@
-name: Check Bot-Created Webhook Rate Limit
+name: Check Multi-Channel Webhook Rate Limits
 
 on:
   workflow_dispatch:
+    inputs:
+      max_per_channel:
+        description: "Max test sends per channel, capped at 10"
+        required: false
+        default: "6"
+      delay_ms:
+        description: "Delay between rounds in ms"
+        required: false
+        default: "100"
 
 jobs:
   check:
@@ -9,47 +18,196 @@ jobs:
 
     env:
       DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-      DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+      DISCORD_CHANNEL_IDS: ${{ secrets.DISCORD_CHANNEL_IDS }}
+      MAX_PER_CHANNEL: ${{ github.event.inputs.max_per_channel }}
+      DELAY_MS: ${{ github.event.inputs.delay_ms }}
 
     steps:
-      - name: Create webhook, send test, print rate-limit headers
+      - name: Test webhook buckets safely
         run: |
-          if [ -z "$DISCORD_BOT_TOKEN" ]; then
-            echo "Missing DISCORD_BOT_TOKEN secret"
-            exit 1
-          fi
+          node <<'NODE'
+          const token = process.env.DISCORD_BOT_TOKEN;
+          const channelIds = (process.env.DISCORD_CHANNEL_IDS || "")
+            .split(",")
+            .map(x => x.trim())
+            .filter(Boolean);
 
-          if [ -z "$DISCORD_CHANNEL_ID" ]; then
-            echo "Missing DISCORD_CHANNEL_ID secret"
-            exit 1
-          fi
+          const maxPerChannel = Math.min(Number(process.env.MAX_PER_CHANNEL || 6), 10);
+          const delayMs = Math.max(Number(process.env.DELAY_MS || 100), 50);
 
-          echo "Creating webhook..."
+          if (!token) throw new Error("Missing DISCORD_BOT_TOKEN");
+          if (!channelIds.length) throw new Error("Missing DISCORD_CHANNEL_IDS");
 
-          CREATE_RESPONSE=$(curl -sS -X POST "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_ID/webhooks" \
-            -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d '{"name":"rate-limit-check"}')
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-          WEBHOOK_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id')
-          WEBHOOK_TOKEN=$(echo "$CREATE_RESPONSE" | jq -r '.token')
+          async function discordFetch(url, options = {}) {
+            return fetch(url, {
+              ...options,
+              headers: {
+                ...(options.headers || {}),
+                "User-Agent": "rate-limit-diagnostic"
+              }
+            });
+          }
 
-          if [ "$WEBHOOK_ID" = "null" ] || [ "$WEBHOOK_TOKEN" = "null" ]; then
-            echo "Failed to create webhook:"
-            echo "$CREATE_RESPONSE"
-            exit 1
-          fi
+          async function createWebhook(channelId) {
+            const res = await discordFetch(
+              `https://discord.com/api/v10/channels/${channelId}/webhooks`,
+              {
+                method: "POST",
+                headers: {
+                  "Authorization": `Bot ${token}`,
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                  name: `rate-limit-check-${Date.now()}`
+                })
+              }
+            );
 
-          echo "Sending webhook test..."
+            const body = await res.json().catch(() => ({}));
 
-          curl -sS -D headers.txt -o body.txt -X POST "https://discord.com/api/v10/webhooks/$WEBHOOK_ID/$WEBHOOK_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d '{"content":"GitHub Actions webhook rate-limit check"}'
+            if (!res.ok) {
+              throw new Error(`Create webhook failed for channel ${channelId}: ${res.status} ${JSON.stringify(body)}`);
+            }
 
-          echo "Rate-limit headers:"
-          grep -i "x-ratelimit\|retry-after" headers.txt || true
+            return {
+              channelId,
+              webhookId: body.id,
+              webhookToken: body.token
+            };
+          }
 
-          echo "Cleaning up webhook..."
+          async function deleteWebhook(webhookId) {
+            await discordFetch(
+              `https://discord.com/api/v10/webhooks/${webhookId}`,
+              {
+                method: "DELETE",
+                headers: {
+                  "Authorization": `Bot ${token}`
+                }
+              }
+            ).catch(() => {});
+          }
 
-          curl -sS -X DELETE "https://discord.com/api/v10/webhooks/$WEBHOOK_ID" \
-            -H "Authorization: Bot $DISCORD_BOT_TOKEN" > /dev/null
+          async function sendWebhook(hook, index) {
+            const started = Date.now();
+
+            const res = await discordFetch(
+              `https://discord.com/api/v10/webhooks/${hook.webhookId}/${hook.webhookToken}`,
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                  content: `rate-limit diagnostic channel=${hook.channelId} send=${index}`
+                })
+              }
+            );
+
+            const elapsedMs = Date.now() - started;
+            const text = await res.text();
+            let json = null;
+
+            try {
+              json = text ? JSON.parse(text) : null;
+            } catch {}
+
+            return {
+              channelId: hook.channelId,
+              webhookId: hook.webhookId,
+              send: index,
+              status: res.status,
+              elapsedMs,
+              bucket: res.headers.get("x-ratelimit-bucket"),
+              limit: res.headers.get("x-ratelimit-limit"),
+              remaining: res.headers.get("x-ratelimit-remaining"),
+              resetAfter: res.headers.get("x-ratelimit-reset-after"),
+              retryAfterHeader: res.headers.get("retry-after"),
+              scope: res.headers.get("x-ratelimit-scope"),
+              globalHeader: res.headers.get("x-ratelimit-global"),
+              globalBody: json?.global,
+              retryAfterBody: json?.retry_after,
+              body: json || text || ""
+            };
+          }
+
+          const hooks = [];
+
+          try {
+            console.log(`Creating webhooks for channels: ${channelIds.join(", ")}`);
+            for (const channelId of channelIds) {
+              const hook = await createWebhook(channelId);
+              hooks.push(hook);
+              console.log(`Created webhook for channel ${channelId}: ${hook.webhookId}`);
+            }
+
+            const results = [];
+            let stopped = false;
+
+            for (let round = 1; round <= maxPerChannel && !stopped; round++) {
+              console.log(`\nRound ${round}/${maxPerChannel}`);
+
+              const roundResults = await Promise.all(
+                hooks.map(hook => sendWebhook(hook, round))
+              );
+
+              for (const r of roundResults) {
+                results.push(r);
+
+                console.log(
+                  [
+                    `channel=${r.channelId}`,
+                    `status=${r.status}`,
+                    `bucket=${r.bucket}`,
+                    `limit=${r.limit}`,
+                    `remaining=${r.remaining}`,
+                    `resetAfter=${r.resetAfter}`,
+                    `scope=${r.scope}`,
+                    `globalHeader=${r.globalHeader}`,
+                    `globalBody=${r.globalBody}`,
+                    `retryAfter=${r.retryAfterHeader || r.retryAfterBody || ""}`,
+                    `elapsedMs=${r.elapsedMs}`
+                  ].join(" | ")
+                );
+
+                if (r.status === 429) {
+                  stopped = true;
+                }
+              }
+
+              if (stopped) {
+                console.log("\nStopped after first 429. Do not keep hammering the API.");
+                break;
+              }
+
+              await sleep(delayMs);
+            }
+
+            console.log("\nSummary by channel:");
+            for (const channelId of channelIds) {
+              const rows = results.filter(r => r.channelId === channelId);
+              const ok = rows.filter(r => r.status >= 200 && r.status < 300).length;
+              const limited = rows.filter(r => r.status === 429).length;
+              const buckets = [...new Set(rows.map(r => r.bucket).filter(Boolean))];
+
+              console.log(`channel=${channelId} ok=${ok} 429=${limited} buckets=${buckets.join(",")}`);
+            }
+
+            const anyGlobal = results.some(r => r.globalHeader === "true" || r.scope === "global" || r.globalBody === true);
+
+            console.log("\nGlobal limit detected:", anyGlobal ? "YES" : "NO");
+
+            if (!anyGlobal) {
+              console.log("Likely route/webhook/channel-scoped for this small test. Not proof that no global limit exists.");
+            }
+
+          } finally {
+            console.log("\nCleaning up webhooks...");
+            for (const hook of hooks) {
+              await deleteWebhook(hook.webhookId);
+              console.log(`Deleted webhook ${hook.webhookId}`);
+            }
+          }
+          NODE
