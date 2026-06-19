@@ -1,28 +1,27 @@
-name: Webhook Epoch Diagnostic
+name: Webhook Increment Epoch Diagnostic
 
 on:
   workflow_dispatch:
     inputs:
       max_channels:
-        description: "How many channels from DISCORD_CHANNEL_IDS to test"
+        description: "Increment channels up to this count"
         required: true
-        default: "2"
+        default: "4"
 
-      max_epoch:
-        description: "Epoch N = N webhooks per channel"
+      max_webhooks_per_channel:
+        description: "Increment webhooks per channel up to this count"
         required: true
-        default: "3"
+        default: "20"
 
       webhook_names:
         description: "Comma-separated names"
         required: false
-        default: "Aarav, Vihaan, Arjun, Reyansh, Ayaan, Krishna, Ishaan, Kabir, Rohan, Aditya, Vivaan, Dhruv, Sai, Neil, Aryan, Anaya, Diya, Myra, Aadhya, Saanvi, Kiara, Avni, Isha, Tara, Meera, Nisha, Kavya, Riya, Siya, Anika, Maya, Zara, Neha, Priya, Aisha, Amara, Leela, Mira, Dev, Kian, Om, Yash, Nikhil, Rahul, Varun, Karan, Amit, Sohan, Arnav, Laksh
-"
+        default: "Aarav, Vihaan, Arjun, Reyansh, Ayaan, Krishna, Ishaan, Kabir, Rohan, Aditya, Vivaan, Dhruv, Sai, Neil, Aryan, Anaya, Diya, Myra, Aadhya, Saanvi, Kiara, Avni, Isha, Tara, Meera, Nisha, Kavya, Riya, Siya, Anika, Maya, Zara, Neha, Priya, Aisha, Amara, Leela, Mira, Dev, Kian, Om, Yash, Nikhil, Rahul, Varun, Karan, Amit, Sohan, Arnav, Laksh"
 
       message_text:
-        description: "Diagnostic message text"
+        description: "Probe message text"
         required: false
-        default: "diagnostic"
+        default: "rate diagnostic"
 
 jobs:
   diagnose:
@@ -32,12 +31,12 @@ jobs:
       DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
       DISCORD_CHANNEL_IDS: ${{ secrets.DISCORD_CHANNEL_IDS }}
       MAX_CHANNELS: ${{ github.event.inputs.max_channels }}
-      MAX_EPOCH: ${{ github.event.inputs.max_epoch }}
+      MAX_WEBHOOKS_PER_CHANNEL: ${{ github.event.inputs.max_webhooks_per_channel }}
       WEBHOOK_NAMES: ${{ github.event.inputs.webhook_names }}
       MESSAGE_TEXT: ${{ github.event.inputs.message_text }}
 
     steps:
-      - name: Run diagnostic
+      - name: Run increment diagnostic
         run: |
           node <<'NODE'
           const token = process.env.DISCORD_BOT_TOKEN;
@@ -50,7 +49,7 @@ jobs:
           )];
 
           const maxChannels = Number(process.env.MAX_CHANNELS || 1);
-          const maxEpoch = Number(process.env.MAX_EPOCH || 1);
+          const maxWebhooksPerChannel = Number(process.env.MAX_WEBHOOKS_PER_CHANNEL || 1);
 
           const channels = allChannels.slice(0, maxChannels);
 
@@ -59,7 +58,7 @@ jobs:
             .map(x => x.trim())
             .filter(Boolean);
 
-          const messageText = process.env.MESSAGE_TEXT || "diagnostic";
+          const messageText = process.env.MESSAGE_TEXT || "rate diagnostic";
 
           if (!token) throw new Error("Missing DISCORD_BOT_TOKEN");
           if (!channels.length) throw new Error("Missing DISCORD_CHANNEL_IDS");
@@ -72,7 +71,7 @@ jobs:
               ...options,
               headers: {
                 ...(options.headers || {}),
-                "User-Agent": "webhook-epoch-diagnostic"
+                "User-Agent": "webhook-increment-diagnostic"
               }
             });
           }
@@ -86,57 +85,46 @@ jobs:
             }
           }
 
-          function getRateInfo(res, body) {
+          function rateInfo(res, body) {
             return {
               status: res.status,
               bucket: res.headers.get("x-ratelimit-bucket"),
-              limit: res.headers.get("x-ratelimit-limit"),
-              remaining: res.headers.get("x-ratelimit-remaining"),
-              resetAfter: res.headers.get("x-ratelimit-reset-after"),
-              retryAfter: res.headers.get("retry-after") || body?.retry_after || "",
+              limit: Number(res.headers.get("x-ratelimit-limit") || 0),
+              remaining: Number(res.headers.get("x-ratelimit-remaining") || 0),
+              resetAfter: Number(res.headers.get("x-ratelimit-reset-after") || 0),
+              retryAfter: Number(res.headers.get("retry-after") || body?.retry_after || 0),
               scope: res.headers.get("x-ratelimit-scope"),
               globalHeader: res.headers.get("x-ratelimit-global"),
               globalBody: body?.global
             };
           }
 
-          function printResult(prefix, obj) {
-            console.log(
-              Object.entries(obj)
-                .map(([k, v]) => `${k}=${v ?? ""}`)
-                .join(" | ")
-            );
+          function log(obj) {
+            console.log(Object.entries(obj).map(([k, v]) => `${k}=${v ?? ""}`).join(" | "));
           }
 
-          async function waitIf429(info, label) {
-            if (info.status !== 429) return;
+          async function waitFrom429(info, action) {
+            if (info.status !== 429) return false;
 
-            const wait =
-              Number(info.retryAfter) ||
-              Number(info.resetAfter) ||
-              1;
+            const wait = info.retryAfter || info.resetAfter || 1;
 
-            printResult("rate_limit", {
-              event: label,
-              status: info.status,
-              retryAfter: wait,
+            log({
+              event: "429",
+              action,
+              waitSeconds: wait,
               scope: info.scope,
               globalHeader: info.globalHeader,
               globalBody: info.globalBody
             });
 
-            await sleep(0);
+            await sleep(Math.ceil(wait * 1000));
+            return true;
           }
 
           async function listWebhooks(channelId) {
-            const res = await discordFetch(
-              `https://discord.com/api/v10/channels/${channelId}/webhooks`,
-              {
-                headers: {
-                  Authorization: `Bot ${token}`
-                }
-              }
-            );
+            const res = await discordFetch(`https://discord.com/api/v10/channels/${channelId}/webhooks`, {
+              headers: { Authorization: `Bot ${token}` }
+            });
 
             const body = await parseBody(res);
 
@@ -149,48 +137,40 @@ jobs:
 
           async function deleteWebhook(id) {
             while (true) {
-              const res = await discordFetch(
-                `https://discord.com/api/v10/webhooks/${id}`,
-                {
-                  method: "DELETE",
-                  headers: {
-                    Authorization: `Bot ${token}`
-                  }
-                }
-              );
+              const res = await discordFetch(`https://discord.com/api/v10/webhooks/${id}`, {
+                method: "DELETE",
+                headers: { Authorization: `Bot ${token}` }
+              });
 
               const body = await parseBody(res);
-              const info = getRateInfo(res, body);
+              const info = rateInfo(res, body);
 
-              if (info.status === 429) {
-                await waitIf429(info, "delete");
-                continue;
-              }
+              if (await waitFrom429(info, "delete")) continue;
 
               return res.ok || res.status === 204 || res.status === 404;
             }
           }
 
-          async function deleteAllWebhooks(channelId) {
+          async function deleteAllInChannel(channelId) {
             const hooks = await listWebhooks(channelId);
 
-            printResult("cleanup", {
+            log({
               event: "cleanup_start",
               channel: channelId,
-              existing: hooks.length
+              existingWebhooks: hooks.length
             });
 
             for (const hook of hooks) {
               await deleteWebhook(hook.id);
-              printResult("cleanup", {
+              log({
                 event: "deleted_existing",
                 channel: channelId,
                 webhook: hook.name,
-                webhook_id: hook.id
+                webhookId: hook.id
               });
             }
 
-            printResult("cleanup", {
+            log({
               event: "cleanup_done",
               channel: channelId
             });
@@ -198,28 +178,22 @@ jobs:
 
           async function createWebhook(channelId, name) {
             while (true) {
-              const res = await discordFetch(
-                `https://discord.com/api/v10/channels/${channelId}/webhooks`,
-                {
-                  method: "POST",
-                  headers: {
-                    Authorization: `Bot ${token}`,
-                    "Content-Type": "application/json"
-                  },
-                  body: JSON.stringify({ name })
-                }
-              );
+              const res = await discordFetch(`https://discord.com/api/v10/channels/${channelId}/webhooks`, {
+                method: "POST",
+                headers: {
+                  Authorization: `Bot ${token}`,
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ name })
+              });
 
               const body = await parseBody(res);
-              const info = getRateInfo(res, body);
+              const info = rateInfo(res, body);
 
-              if (info.status === 429) {
-                await waitIf429(info, "create");
-                continue;
-              }
+              if (await waitFrom429(info, "create")) continue;
 
               if (!res.ok) {
-                printResult("create_failed", {
+                log({
                   event: "create_failed",
                   channel: channelId,
                   name,
@@ -234,11 +208,11 @@ jobs:
               const url = `https://discord.com/api/v10/webhooks/${body.id}/${body.token}`;
               console.log(`::add-mask::${url}`);
 
-              printResult("created", {
+              log({
                 event: "created",
                 channel: channelId,
                 name,
-                webhook_id: body.id
+                webhookId: body.id
               });
 
               return {
@@ -251,32 +225,31 @@ jobs:
             }
           }
 
-          async function sendOnce(webhook, label) {
+          async function sendProbe(webhook, epoch, channelCount, webhooksPerChannel) {
             const started = Date.now();
 
             const res = await discordFetch(webhook.url, {
               method: "POST",
-              headers: {
-                "Content-Type": "application/json"
-              },
+              headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
-                content: `${messageText} | ${label} | channel=${webhook.channelId} | webhook=${webhook.name}`
+                content: `${messageText} | epoch=${epoch} | channel=${webhook.channelId} | webhook=${webhook.name}`
               })
             });
 
             const elapsedMs = Date.now() - started;
             const body = await parseBody(res);
-            const info = getRateInfo(res, body);
+            const info = rateInfo(res, body);
 
-            const limitNum = Number(info.limit || 0);
-            const resetNum = Number(info.resetAfter || 0);
-            const approxPerSecond = limitNum && resetNum
-              ? (limitNum / resetNum).toFixed(3)
-              : "";
+            const estimatedWebhookMsgPerSec =
+              info.limit && info.resetAfter
+                ? info.limit / info.resetAfter
+                : 0;
 
-            printResult("send_result", {
-              event: "send",
-              label,
+            log({
+              event: "probe",
+              epoch,
+              channels: channelCount,
+              webhooksPerChannel,
               channel: webhook.channelId,
               webhook: webhook.name,
               status: info.status,
@@ -284,7 +257,7 @@ jobs:
               limit: info.limit,
               remaining: info.remaining,
               resetAfter: info.resetAfter,
-              approxPerSecondFromHeaders: approxPerSecond,
+              estimatedSameWebhookMsgPerSec: estimatedWebhookMsgPerSec.toFixed(3),
               scope: info.scope,
               globalHeader: info.globalHeader,
               globalBody: info.globalBody,
@@ -292,204 +265,167 @@ jobs:
               elapsedMs
             });
 
-            return info;
+            return {
+              ...info,
+              estimatedWebhookMsgPerSec
+            };
           }
 
-          async function createHooksFor(channelSet, hooksPerChannel, label) {
+          async function runEpoch(epoch, channelCount, webhooksPerChannel) {
+            const selectedChannels = channels.slice(0, channelCount);
             const created = [];
 
-            for (const channelId of channelSet) {
-              for (let i = 0; i < hooksPerChannel; i++) {
-                const baseName = names[i % names.length];
-                const hook = await createWebhook(channelId, `${baseName}-${label}-h${i + 1}`);
-
-                if (hook) created.push(hook);
-              }
-            }
-
-            return created;
-          }
-
-          async function deleteCreatedHooks(hooks) {
-            for (const hook of hooks) {
-              await deleteWebhook(hook.id);
-              printResult("cleanup", {
-                event: "deleted_created",
-                channel: hook.channelId,
-                webhook: hook.name,
-                webhook_id: hook.id
-              });
-            }
-          }
-
-          async function runSameWebhookHeaderProbe() {
-            const label = "category_same_webhook_header_probe";
-            const channelId = channels[0];
-            const hooks = [];
-
-            printResult("category", {
-              event: "start",
-              category: "same_webhook",
-              note: "single send only; rate inferred from headers"
+            log({
+              event: "epoch_start",
+              epoch,
+              channels: channelCount,
+              webhooksPerChannel,
+              intendedTotalWebhooks: channelCount * webhooksPerChannel,
+              intendedProbeMessages: channelCount * webhooksPerChannel
             });
 
             try {
-              const hook = await createWebhook(channelId, `${names[0]}-same-webhook-probe`);
-              if (!hook) return false;
+              for (const channelId of selectedChannels) {
+                for (let i = 0; i < webhooksPerChannel; i++) {
+                  const baseName = names[i % names.length];
+                  const name = `${baseName}-e${epoch}-c${channelCount}-w${i + 1}`;
 
-              hooks.push(hook);
-
-              const info = await sendOnce(hook, label);
-              return info.status === 429;
-
-            } finally {
-              await deleteCreatedHooks(hooks);
-            }
-          }
-
-          async function runDifferentWebhooksOneChannel() {
-            const channelId = channels[0];
-
-            for (let epoch = 1; epoch <= maxEpoch; epoch++) {
-              const label = `category_1channel_${epoch}webhooks`;
-              const hooks = [];
-
-              printResult("category", {
-                event: "start",
-                category: "one_channel_different_webhooks",
-                epoch,
-                channels: 1,
-                webhooksPerChannel: epoch,
-                totalMessages: epoch
-              });
-
-              try {
-                hooks.push(...await createHooksFor([channelId], epoch, `1c-e${epoch}`));
-
-                const started = Date.now();
-                const results = await Promise.all(hooks.map(h => sendOnce(h, label)));
-                const elapsedMs = Date.now() - started;
-
-                const ok = results.filter(r => r.status >= 200 && r.status < 300).length;
-                const limited = results.filter(r => r.status === 429).length;
-                const global = results.some(r =>
-                  r.scope === "global" ||
-                  r.globalHeader === "true" ||
-                  r.globalBody === true
-                );
-
-                printResult("summary", {
-                  category: "one_channel_different_webhooks",
-                  epoch,
-                  channels: 1,
-                  webhooksPerChannel: epoch,
-                  attemptedMessages: results.length,
-                  ok,
-                  limited,
-                  globalLimitDetected: global,
-                  wallMs: elapsedMs,
-                  observedMessagesPerSecond: elapsedMs ? (ok / (elapsedMs / 1000)).toFixed(3) : ""
-                });
-
-                if (limited > 0) return true;
-
-              } finally {
-                await deleteCreatedHooks(hooks);
-              }
-            }
-
-            return false;
-          }
-
-          async function runMultipleChannelsDifferentWebhooks() {
-            for (let channelN = 1; channelN <= channels.length; channelN++) {
-              const selected = channels.slice(0, channelN);
-
-              for (let epoch = 1; epoch <= maxEpoch; epoch++) {
-                const label = `category_${channelN}channels_${epoch}webhooks_each`;
-                const hooks = [];
-
-                printResult("category", {
-                  event: "start",
-                  category: "multi_channel_different_webhooks",
-                  epoch,
-                  channels: channelN,
-                  webhooksPerChannel: epoch,
-                  totalMessages: channelN * epoch
-                });
-
-                try {
-                  hooks.push(...await createHooksFor(selected, epoch, `${channelN}c-e${epoch}`));
-
-                  const started = Date.now();
-                  const results = await Promise.all(hooks.map(h => sendOnce(h, label)));
-                  const elapsedMs = Date.now() - started;
-
-                  const ok = results.filter(r => r.status >= 200 && r.status < 300).length;
-                  const limited = results.filter(r => r.status === 429).length;
-                  const global = results.some(r =>
-                    r.scope === "global" ||
-                    r.globalHeader === "true" ||
-                    r.globalBody === true
-                  );
-
-                  printResult("summary", {
-                    category: "multi_channel_different_webhooks",
-                    epoch,
-                    channels: channelN,
-                    webhooksPerChannel: epoch,
-                    attemptedMessages: results.length,
-                    ok,
-                    limited,
-                    globalLimitDetected: global,
-                    wallMs: elapsedMs,
-                    observedMessagesPerSecond: elapsedMs ? (ok / (elapsedMs / 1000)).toFixed(3) : ""
-                  });
-
-                  if (limited > 0) return true;
-
-                } finally {
-                  await deleteCreatedHooks(hooks);
+                  const hook = await createWebhook(channelId, name);
+                  if (hook) created.push(hook);
                 }
               }
-            }
 
-            return false;
+              if (!created.length) {
+                log({
+                  event: "epoch_stop",
+                  epoch,
+                  reason: "no_webhooks_created"
+                });
+                return true;
+              }
+
+              const batchStart = Date.now();
+
+              const results = await Promise.all(
+                created.map(hook => sendProbe(hook, epoch, channelCount, webhooksPerChannel))
+              );
+
+              const wallMs = Date.now() - batchStart;
+
+              const ok = results.filter(r => r.status >= 200 && r.status < 300).length;
+              const limited = results.filter(r => r.status === 429).length;
+
+              const globalDetected = results.some(r =>
+                r.scope === "global" ||
+                r.globalHeader === "true" ||
+                r.globalBody === true
+              );
+
+              const perWebhookEstimate = results
+                .filter(r => r.estimatedWebhookMsgPerSec > 0)
+                .map(r => r.estimatedWebhookMsgPerSec);
+
+              const avgPerWebhookEstimate =
+                perWebhookEstimate.length
+                  ? perWebhookEstimate.reduce((a, b) => a + b, 0) / perWebhookEstimate.length
+                  : 0;
+
+              const estimatedCombinedMsgPerSec =
+                avgPerWebhookEstimate * created.length;
+
+              const observedProbeMsgPerSec =
+                wallMs ? ok / (wallMs / 1000) : 0;
+
+              log({
+                event: "epoch_summary",
+                epoch,
+                channels: channelCount,
+                webhooksPerChannel,
+                totalWebhooks: created.length,
+                probeMessages: results.length,
+                ok,
+                limited,
+                globalDetected,
+                avgSameWebhookMsgPerSecFromHeaders: avgPerWebhookEstimate.toFixed(3),
+                estimatedCombinedMsgPerSecFromHeaders: estimatedCombinedMsgPerSec.toFixed(3),
+                observedProbeMsgPerSec: observedProbeMsgPerSec.toFixed(3),
+                wallMs
+              });
+
+              if (limited > 0) {
+                log({
+                  event: "stop",
+                  epoch,
+                  reason: "429_seen"
+                });
+                return true;
+              }
+
+              return false;
+
+            } finally {
+              for (const hook of created) {
+                await deleteWebhook(hook.id);
+                log({
+                  event: "deleted_epoch_webhook",
+                  epoch,
+                  channel: hook.channelId,
+                  webhook: hook.name,
+                  webhookId: hook.id
+                });
+              }
+            }
           }
 
           console.log("selected_channels:", channels.join(", "));
-          console.log("max_epoch:", maxEpoch);
-          console.log("names:", names.join(", "));
+          console.log("max_channels:", maxChannels);
+          console.log("max_webhooks_per_channel:", maxWebhooksPerChannel);
 
-          console.log("\nDELETE ALL EXISTING WEBHOOKS ONCE");
+          console.log("\nDELETE ALL EXISTING WEBHOOKS FIRST");
           for (const channelId of channels) {
-            await deleteAllWebhooks(channelId);
+            await deleteAllInChannel(channelId);
           }
 
-          console.log("\nCATEGORY 1: SAME WEBHOOK HEADER PROBE");
-          const sameWebhookLimited = await runSameWebhookHeaderProbe();
-          if (sameWebhookLimited) {
-            console.log("stopped=true | reason=429_in_same_webhook_probe");
-            process.exit(0);
-          }
+          let epoch = 1;
 
-          console.log("\nCATEGORY 2: ONE CHANNEL, DIFFERENT WEBHOOKS");
-          const oneChannelLimited = await runDifferentWebhooksOneChannel();
-          if (oneChannelLimited) {
-            console.log("stopped=true | reason=429_in_one_channel_different_webhooks");
-            process.exit(0);
-          }
+          /*
+            Correct increment model:
 
-          console.log("\nCATEGORY 3: MULTIPLE CHANNELS, DIFFERENT WEBHOOKS");
-          const multiChannelLimited = await runMultipleChannelsDifferentWebhooks();
-          if (multiChannelLimited) {
-            console.log("stopped=true | reason=429_in_multi_channel_test");
-            process.exit(0);
+            1 channel:
+              epoch 1: 1 webhook
+              epoch 2: 2 webhooks
+              epoch 3: 3 webhooks
+              ...
+
+            2 channels:
+              next epoch: 2 channels × 1 webhook
+              next epoch: 2 channels × 2 webhooks
+              ...
+
+            3 channels:
+              next epoch: 3 channels × 1 webhook
+              ...
+          */
+
+          for (let channelCount = 1; channelCount <= channels.length; channelCount++) {
+            for (let webhooksPerChannel = 1; webhooksPerChannel <= maxWebhooksPerChannel; webhooksPerChannel++) {
+              const shouldStop = await runEpoch(epoch, channelCount, webhooksPerChannel);
+              epoch++;
+
+              if (shouldStop) {
+                console.log("stopped=true");
+                console.log("\nFINAL CLEANUP");
+                for (const channelId of channels) {
+                  await deleteAllInChannel(channelId);
+                }
+                process.exit(0);
+              }
+            }
           }
 
           console.log("\nFINAL CLEANUP");
           for (const channelId of channels) {
-            await deleteAllWebhooks(channelId);
+            await deleteAllInChannel(channelId);
           }
 
           console.log("done=true");
