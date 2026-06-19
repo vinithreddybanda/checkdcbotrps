@@ -6,7 +6,7 @@ on:
       webhook_names:
         description: "Comma-separated names. 1 name = 1 webhook."
         required: false
-        default: "Aarav, Vihaan, Arjun, Reyansh, Ayaan, Krishna, Ishaan, Kabir, Rohan, Aditya, Vivaan, Dhruv, Sai, Neil, Aryan, Anaya, Diya, Myra, Aadhya, Saanvi, Kiara, Avni, Isha, Tara, Meera, Nisha, Kavya, Riya, Siya, Anika, Maya, Zara, Neha, Priya, Aisha, Amara, Leela, Mira, Dev, Kian, Om, Yash, Nikhil, Rahul, Varun, Karan, Amit, Sohan"
+        default: "Aarav, Vihaan, Arjun"
 
       messages_per_webhook:
         description: "How many messages each webhook should send"
