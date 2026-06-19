@@ -1,0 +1,55 @@
+name: Check Bot-Created Webhook Rate Limit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    env:
+      DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+      DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+
+    steps:
+      - name: Create webhook, send test, print rate-limit headers
+        run: |
+          if [ -z "$DISCORD_BOT_TOKEN" ]; then
+            echo "Missing DISCORD_BOT_TOKEN secret"
+            exit 1
+          fi
+
+          if [ -z "$DISCORD_CHANNEL_ID" ]; then
+            echo "Missing DISCORD_CHANNEL_ID secret"
+            exit 1
+          fi
+
+          echo "Creating webhook..."
+
+          CREATE_RESPONSE=$(curl -sS -X POST "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_ID/webhooks" \
+            -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"name":"rate-limit-check"}')
+
+          WEBHOOK_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id')
+          WEBHOOK_TOKEN=$(echo "$CREATE_RESPONSE" | jq -r '.token')
+
+          if [ "$WEBHOOK_ID" = "null" ] || [ "$WEBHOOK_TOKEN" = "null" ]; then
+            echo "Failed to create webhook:"
+            echo "$CREATE_RESPONSE"
+            exit 1
+          fi
+
+          echo "Sending webhook test..."
+
+          curl -sS -D headers.txt -o body.txt -X POST "https://discord.com/api/v10/webhooks/$WEBHOOK_ID/$WEBHOOK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"content":"GitHub Actions webhook rate-limit check"}'
+
+          echo "Rate-limit headers:"
+          grep -i "x-ratelimit\|retry-after" headers.txt || true
+
+          echo "Cleaning up webhook..."
+
+          curl -sS -X DELETE "https://discord.com/api/v10/webhooks/$WEBHOOK_ID" \
+            -H "Authorization: Bot $DISCORD_BOT_TOKEN" > /dev/null
